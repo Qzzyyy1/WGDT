@@ -1,0 +1,89 @@
+{
+    "Houston13_7gt": {
+        "path": "Houston_7gt",
+        "norm": true,
+        "file_name": "Houston13.mat",
+        "mat_name": "ori_data",
+        "gt_file_name": "Houston13_7gt.mat",
+        "gt_mat_name": "map",
+        "image_width": 210,
+        "image_height": 954,
+        "bands_num": 48,
+        "num_classes": 7
+    },
+    "PaviaU_7gt": {
+        "path": "Pavia_7gt",
+        "file_name": "paviaU.mat",
+        "mat_name": "paviaU",
+        "gt_file_name": "paviaU_gt_7.mat",
+        "gt_mat_name": "paviaU_gt_7",
+        "image_width": 610,
+        "image_height": 340,
+        "bands_num": 102,
+        "num_classes": 7
+    },
+    "HyRank_source":{
+        "path": "HyRANK",
+        "file_name": "Dioni.mat",
+        "mat_name": "ori_data",
+        "gt_file_name": "Dioni_gt_out68.mat",
+        "gt_mat_name": "map",
+        "image_width": 250,
+        "image_height": 1376,
+        "bands_num": 176,
+        "num_classes": 12
+    },
+    "HyRank_target":{
+        "path": "HyRANK",
+        "file_name": "Loukia.mat",
+        "mat_name": "ori_data",
+        "gt_file_name": "Loukia_gt_out68.mat",
+        "gt_mat_name": "map",
+        "image_width": 249,
+        "image_height": 945,
+        "bands_num": 176,
+        "num_classes": 12
+    },
+    "Yancheng_ZY": {
+        "path": "Yancheng",
+        "file_name": "ZY_YC_data147.mat",
+        "mat_name": "Data",
+        "gt_file_name": "ZY_YC_gt7.mat",
+        "gt_mat_name": "DataClass",
+        "image_width": 1398,
+        "image_height": 942,
+        "bands_num": 147,
+        "num_classes": 7
+    },
+    "Yancheng_GF": {
+        "path": "Yancheng",
+        "file_name": "GF_YC_data.mat",
+        "mat_name": "Data",
+        "gt_file_name": "GF_YC_gt.mat",
+        "gt_mat_name": "DataClass",
+        "image_width": 1175,
+        "image_height": 585,
+        "bands_num": 147,
+        "num_classes": 7
+    },
+    "PaviaC_OS": {
+        "path": "PaviaC",
+        "type": "npy",
+        "file_name": "PaviaC_OS.npy",
+        "gt_file_name": "PaviaC_OS_gt.npy",
+        "image_width": 1096,
+        "image_height": 715,
+        "bands_num": 102,
+        "num_classes": 9
+    },
+    "Houston18_OS": {
+        "path": "Houston18",
+        "type": "npy",
+        "file_name": "Houston18_OS.npy",
+        "gt_file_name": "Houston18_OS_gt.npy",
+        "image_width": 2384,
+        "image_height": 601,
+        "bands_num": 48,
+        "num_classes": 19
+    }
+}
