@@ -28,6 +28,7 @@ class Model(nn.Module):
         self.known_num_classes = known_num_classes
 
         self.feature_encoder = DCRN(in_channels, patch, known_num_classes)
+        self.source_classifier = nn.Linear(288, known_num_classes)
         self.prototype_memory = PrototypeMemory(
             num_classes=known_num_classes,
             feat_dim=288,
@@ -169,19 +170,20 @@ class Model(nn.Module):
         if y is not None and update_prototypes:
             self.prototype_memory.update(features, y, epoch=epoch)
 
-        logits = self.prototype_memory.compute_logits(features)
+        logits = self.source_classifier(features)
         prediction = logits.argmax(dim=1)
+        prototype_logits = self.prototype_memory.compute_logits(features)
         out = {
             'features': features,
             'logits': logits,
             'prediction': prediction,
+            'prototype_logits': prototype_logits,
         }
 
         if y is not None:
             out['loss_cls'] = F.cross_entropy(logits, y)
             out['loss_proto'] = self.prototype_memory.compactness_loss(features, y)
         return out
-
     def forward_target(self, x):
         features = self.encode(x)
         prototypes = self.prototype_memory.get_prototypes().detach()
@@ -220,12 +222,14 @@ class Model(nn.Module):
 
     def pre_train_optimizer(self):
         return torch.optim.SGD(
-            self.feature_encoder.parameters(),
+            [
+                {'params': self.feature_encoder.parameters()},
+                {'params': self.source_classifier.parameters()},
+            ],
             lr=0.001,
             momentum=0.9,
             weight_decay=5e-4,
         )
-
     def train_step(self, batch):
         [source_x, source_y], [target_x, target_y] = batch
         epoch = self.progress.epoch if hasattr(self, 'progress') else 0
@@ -313,12 +317,14 @@ class Model(nn.Module):
 
     def train_optimizer(self):
         return torch.optim.SGD(
-            self.feature_encoder.parameters(),
+            [
+                {'params': self.feature_encoder.parameters()},
+                {'params': self.source_classifier.parameters()},
+            ],
             lr=self.args.lr_encoder,
             momentum=0.9,
             weight_decay=5e-4,
         )
-
     def test_step(self, batch):
         x, y = batch
         out = self.forward_target(x)
