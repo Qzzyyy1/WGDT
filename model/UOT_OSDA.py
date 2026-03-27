@@ -3,11 +3,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchmetrics import Accuracy
 
-from utils.meter import OpensetDomainMetric
+from utils.file import check_path
+from utils.meter import OpensetDomainMetric, computeOpensetDomainResult
 from utils.Trainer import Trainer
 from utils.dataLoader import CombinedLoader
-from utils.open_set import predict_open_set
-from utils.utils import mergeArgs
+from utils.open_set import predict_open_set, fuse_unknown_score
+from utils.utils import mergeArgs, getCliOverrideKeys
+from utils.pyExt import dataToDevice
 from .DCRN import DCRN
 from .Prototype import PrototypeMemory
 from .UOT import UOTSolver
@@ -42,12 +44,109 @@ class Model(nn.Module):
             metric=args.uot_metric,
             dustbin_quantile=args.dustbin_quantile,
             dustbin_beta=args.dustbin_beta,
+            dustbin_mass_prior=args.dustbin_mass_prior,
             use_no_grad=args.uot_no_grad == 'True',
         )
 
         self.source_oa = Accuracy()
         self.metric = OpensetDomainMetric(self.known_num_classes, self.args)
         self.prediciton_all = []
+
+        self.register_buffer('running_threshold', torch.tensor(float(args.unknown_threshold)))
+        self.register_buffer('threshold_initialized', torch.tensor(False, dtype=torch.bool))
+
+        self.source_dustbin_score_list = []
+        self.target_dustbin_ratio_list = []
+        self.best_oracle_hscore = float('-inf')
+        self.oracle_loader = None
+
+    def get_unknown_threshold(self):
+        return float(self.running_threshold.item())
+
+    def build_unknown_score(self, out):
+        out['unknown_score'] = fuse_unknown_score(
+            out['mass_unknown_score'],
+            out['distance_unknown_score'],
+            alpha=self.args.unknown_score_alpha,
+        )
+        return out
+
+    def update_running_threshold(self):
+        if len(self.source_dustbin_score_list) == 0:
+            return self.get_unknown_threshold()
+
+        scores = torch.cat(self.source_dustbin_score_list).detach().float()
+        current_threshold = torch.quantile(scores, self.args.threshold_quantile)
+
+        if not self.threshold_initialized:
+            self.running_threshold.copy_(current_threshold)
+            self.threshold_initialized.fill_(True)
+        else:
+            updated = self.args.threshold_ema * self.running_threshold + (1.0 - self.args.threshold_ema) * current_threshold
+            self.running_threshold.copy_(updated)
+
+        self.source_dustbin_score_list = []
+        return self.get_unknown_threshold()
+
+    def save_checkpoint(self, filename, extra=None):
+        save_dir = f'logs/{self.args.log_name}/checkpoints'
+        check_path(save_dir)
+        save_path = f'{save_dir}/{filename}'
+        save_dict = {
+            'epoch': self.progress.epoch if hasattr(self, 'progress') else 0,
+            'model_state_dict': self.state_dict(),
+            'running_threshold': self.get_unknown_threshold(),
+            'args': vars(self.args),
+        }
+        if extra is not None:
+            save_dict.update(extra)
+        torch.save(save_dict, save_path)
+
+    def save_state_dict_only(self, filename, extra=None):
+        save_dir = f'logs/{self.args.log_name}/checkpoints'
+        check_path(save_dir)
+        save_path = f'{save_dir}/{filename}'
+        save_dict = {
+            'model_state_dict': self.state_dict(),
+        }
+        if extra is not None:
+            save_dict.update(extra)
+        torch.save(save_dict, save_path)
+
+    def evaluate_oracle(self):
+        if self.oracle_loader is None:
+            return None
+
+        was_training = self.training
+        prediction_list = []
+        target_list = []
+        unknown_score_list = []
+
+        self.eval()
+        with torch.no_grad():
+            for data in self.oracle_loader:
+                x, y = dataToDevice(data, self.device)
+                out = self.forward_target(x)
+                prediction = predict_open_set(
+                    out['class_scores'],
+                    out['unknown_score'],
+                    self.get_unknown_threshold(),
+                    self.known_num_classes,
+                )
+                prediction_list.append(prediction.detach().cpu())
+                target_list.append(y.detach().cpu())
+                unknown_score_list.append(out['unknown_score'].detach().cpu())
+
+        if was_training:
+            self.train()
+
+        result = computeOpensetDomainResult(
+            torch.cat(prediction_list),
+            torch.cat(target_list),
+            self.known_num_classes,
+            torch.cat(unknown_score_list),
+        )
+        return result
 
     def encode(self, x):
         return self.feature_encoder(x)['features']
@@ -74,10 +173,16 @@ class Model(nn.Module):
         features = self.encode(x)
         prototypes = self.prototype_memory.get_prototypes().detach()
         uot_out = self.uot_solver(prototypes, features)
-        return {
+        out = {
             'features': features,
             **uot_out,
         }
+        return self.build_unknown_score(out)
+
+    def forward_uot_by_features(self, features):
+        prototypes = self.prototype_memory.get_prototypes().detach()
+        out = self.uot_solver(prototypes, features)
+        return self.build_unknown_score(out)
 
     def pre_train_step(self, batch):
         x, y = batch
@@ -113,7 +218,11 @@ class Model(nn.Module):
         epoch = self.progress.epoch if hasattr(self, 'progress') else 0
 
         source_out = self.forward_source(source_x, source_y, epoch=epoch, update_prototypes=True)
+        source_uot_out = self.forward_uot_by_features(source_out['features'].detach())
         target_out = self.forward_target(target_x)
+
+        self.source_dustbin_score_list.append(source_uot_out['unknown_score'].detach().cpu())
+        self.target_dustbin_ratio_list.append(target_out['target_dustbin_ratio'].detach().cpu())
 
         loss_dic = {
             'loss_cls': source_out['loss_cls'],
@@ -126,7 +235,11 @@ class Model(nn.Module):
         information = {
             **loss_dic,
             'dustbin_mean': target_out['dustbin_scores'].mean(),
+            'unknown_score_mean': target_out['unknown_score'].mean(),
             'dustbin_cost': target_out['dustbin_cost'],
+            'dustbin_mass_prior': target_out['dustbin_mass_prior'],
+            'target_dustbin_ratio': target_out['target_dustbin_ratio'],
+            'source_threshold_batch': torch.quantile(source_uot_out['unknown_score'].detach(), self.args.threshold_quantile),
         }
         return {
             'loss': sum(value for value in loss_dic.values()),
@@ -134,10 +247,40 @@ class Model(nn.Module):
         }
 
     def train_epoch_end(self):
+        threshold = self.update_running_threshold()
+        target_dustbin_ratio = None
+        if len(self.target_dustbin_ratio_list) > 0:
+            target_dustbin_ratio = torch.stack(self.target_dustbin_ratio_list).mean()
+            self.target_dustbin_ratio_list = []
+
         dic = {
-            'source_oa': self.source_oa.compute()
+            'source_oa': self.source_oa.compute(),
+            'running_threshold': threshold,
         }
+        if target_dustbin_ratio is not None:
+            dic['target_dustbin_ratio'] = target_dustbin_ratio
+
+        oracle_result = self.evaluate_oracle()
+        if oracle_result is not None:
+            oracle_hscore = float(oracle_result['hos'])
+            dic['oracle_hos'] = oracle_hscore
+            dic['oracle_unknown'] = oracle_result['unknown']
+            dic['oracle_aa_known'] = oracle_result['aa_known']
+            print(f"[ORACLE Bounds] Target H-Score: {oracle_hscore * 100:.2f}%")
+
+            if self.args.save_best_oracle_checkpoint == 'True' and oracle_hscore > self.best_oracle_hscore:
+                self.best_oracle_hscore = oracle_hscore
+                self.save_state_dict_only(
+                    'best_oracle_hscore.pth',
+                    {
+                        'best_oracle_hscore': oracle_hscore,
+                        'epoch': self.progress.epoch if hasattr(self, 'progress') else 0,
+                    }
+                )
+
         self.source_oa.reset()
+        if self.args.save_last_checkpoint == 'True':
+            self.save_checkpoint('last_checkpoint.pth', {'target_dustbin_ratio': float(target_dustbin_ratio) if target_dustbin_ratio is not None else None})
         return dic
 
     def train_optimizer(self):
@@ -153,11 +296,11 @@ class Model(nn.Module):
         out = self.forward_target(x)
         prediction = predict_open_set(
             out['class_scores'],
-            out['dustbin_scores'],
-            self.args.unknown_threshold,
+            out['unknown_score'],
+            self.get_unknown_threshold(),
             self.known_num_classes,
         )
-        self.metric.update(prediction, y, out['dustbin_scores'])
+        self.metric.update(prediction, y, out['unknown_score'])
 
     def test_end(self):
         self.metric.finish()
@@ -167,8 +310,8 @@ class Model(nn.Module):
         out = self.forward_target(x)
         prediction = predict_open_set(
             out['class_scores'],
-            out['dustbin_scores'],
-            self.args.unknown_threshold,
+            out['unknown_score'],
+            self.get_unknown_threshold(),
             self.known_num_classes,
         )
         self.prediciton_all.append(prediction)
@@ -188,6 +331,7 @@ class Model(nn.Module):
 
 def run_model(model: Model, data_loader: dict):
     trainer = Trainer(model, model.device)
+    model.oracle_loader = data_loader['target']['test']
 
     if model.args.pre_train == 'True':
         trainer.train('pre_train', data_loader['source']['train'], model.args.pre_train_epochs)
@@ -239,8 +383,8 @@ def parse_args():
     parser.add_argument('--prototype_loss_weight', type=float, default=0.05)
 
     parser.add_argument('--uot_epsilon', type=float, default=0.05)
-    parser.add_argument('--uot_tau_source', type=float, default=1.0)
-    parser.add_argument('--uot_tau_target', type=float, default=1.0)
+    parser.add_argument('--uot_tau_source', type=float, default=0.95)
+    parser.add_argument('--uot_tau_target', type=float, default=0.95)
     parser.add_argument('--uot_max_iter', type=int, default=30)
     parser.add_argument('--uot_metric', type=str, choices=['euclidean', 'cosine'], default='euclidean')
     parser.add_argument('--uot_loss_weight', type=float, default=1.0)
@@ -248,8 +392,14 @@ def parse_args():
 
     parser.add_argument('--dustbin_quantile', type=float, default=0.8)
     parser.add_argument('--dustbin_beta', type=float, default=0.95)
+    parser.add_argument('--dustbin_mass_prior', type=float, default=0.05)
     parser.add_argument('--unknown_threshold', type=float, default=0.5)
+    parser.add_argument('--threshold_quantile', type=float, default=0.95)
+    parser.add_argument('--threshold_ema', type=float, default=0.9)
+    parser.add_argument('--save_last_checkpoint', type=str, default='True')
+    parser.add_argument('--save_best_oracle_checkpoint', type=str, default='True')
+    parser.add_argument('--unknown_score_alpha', type=float, default=0.5)
 
     args = parser.parse_args()
-    mergeArgs(args, args.target_dataset)
+    mergeArgs(args, args.target_dataset, getCliOverrideKeys())
     return args

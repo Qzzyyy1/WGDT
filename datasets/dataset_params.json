@@ -9,7 +9,13 @@
         "domain_loss_weight": 1.5,
         "radius_loss_weight": 0.1,
         "anchor_weight": 12,
-        "radius_margin": 0.3
+        "radius_margin": 0.3,
+        "uot_epsilon": 0.05,
+        "uot_loss_weight": 0.5,
+        "dustbin_quantile": 0.9,
+        "dustbin_mass_prior": 0.05,
+        "threshold_quantile": 0.95,
+        "prototype_warmup_epochs": 5
     },
     "Houston18_OS": {
         "lr_encoder": 0.001,
@@ -21,7 +27,13 @@
         "domain_loss_weight": 1.0,
         "radius_loss_weight": 0.1,
         "anchor_weight": 10,
-        "radius_margin": 0.01
+        "radius_margin": 0.01,
+        "uot_epsilon": 0.1,
+        "uot_loss_weight": 1.0,
+        "dustbin_quantile": 0.8,
+        "dustbin_mass_prior": 0.1,
+        "threshold_quantile": 0.9,
+        "prototype_warmup_epochs": 10
     },
     "HyRank_target": {
         "lr_encoder": 0.001,
@@ -34,7 +46,13 @@
         "radius_loss_weight": 1.0,
         "batch": 128,
         "anchor_weight": 10,
-        "radius_margin": 0.2
+        "radius_margin": 0.2,
+        "uot_epsilon": 0.1,
+        "uot_loss_weight": 1.0,
+        "dustbin_quantile": 0.85,
+        "dustbin_mass_prior": 0.08,
+        "threshold_quantile": 0.9,
+        "prototype_warmup_epochs": 10
     },
     "Yancheng_GF": {
         "lr_encoder": 0.001,
@@ -47,6 +65,12 @@
         "radius_loss_weight": 0.5,
         "batch": 32,
         "anchor_weight": 10,
-        "radius_margin": 0.005
+        "radius_margin": 0.005,
+        "uot_epsilon": 0.05,
+        "uot_loss_weight": 0.5,
+        "dustbin_quantile": 0.85,
+        "dustbin_mass_prior": 0.08,
+        "threshold_quantile": 0.9,
+        "prototype_warmup_epochs": 5
     }
 }

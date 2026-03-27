@@ -5,6 +5,12 @@ def calibrate_unknown_score(unknown_score):
     return torch.clamp(unknown_score, min=0.0, max=1.0)
 
 
+def fuse_unknown_score(mass_unknown_score, distance_unknown_score, alpha=0.5):
+    mass_unknown_score = calibrate_unknown_score(mass_unknown_score)
+    distance_unknown_score = calibrate_unknown_score(distance_unknown_score)
+    return calibrate_unknown_score(alpha * mass_unknown_score + (1.0 - alpha) * distance_unknown_score)
+
+
 def fit_threshold(scores, method='quantile', q=0.95):
     if not isinstance(scores, torch.Tensor):
         scores = torch.tensor(scores)

@@ -6,7 +6,7 @@ from utils.dann import DomainDiscriminator, DomainAdversarialLoss
 from utils.meter import OpensetDomainMetric
 from utils.Trainer import Trainer
 from utils.dataLoader import CombinedLoader
-from utils.utils import mergeArgs
+from utils.utils import mergeArgs, getCliOverrideKeys
 from .DCRN import DCRN
 from .Anchor import Anchor
 from .Radius import Radius
@@ -213,6 +213,6 @@ def parse_args():
 
     args = parser.parse_args()
 
-    mergeArgs(args, args.target_dataset)
+    mergeArgs(args, args.target_dataset, getCliOverrideKeys())
 
     return args

@@ -32,7 +32,7 @@ def computeOpensetDomainResult(prediction: MatrixSequence, label: MatrixSequence
     oa_known = known_meter(prediction[known_mask], label[known_mask])
     aa_known = classes_acc[:-1].mean()
     unknown = unknown_meter(prediction[unknown_mask], label[unknown_mask])
-    hos = (2 * aa_known * unknown) / (aa_known + unknown)
+    hos = (2 * aa_known * unknown) / (aa_known + unknown + 1e-5)
 
     result = {
         'oa': oa,

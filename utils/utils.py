@@ -3,16 +3,33 @@ import torch
 import random
 import os
 import numpy as np
+import sys
 
 from utils.file import read_strategy
 
 from .pyExt import Dict2Obj
 
-def mergeArgs(args, dataset):
+def getCliOverrideKeys(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+
+    keys = set()
+    for token in argv:
+        if token.startswith('--'):
+            key = token[2:].split('=')[0].replace('-', '_')
+            keys.add(key)
+    return keys
+
+def mergeArgs(args, dataset, cli_override_keys=None):
     with open("datasets/dataset_params.json", "r", encoding="utf-8") as f:
         info = json.load(f)[dataset]
+
+    if cli_override_keys is None:
+        cli_override_keys = set()
     
     for key, value in info.items():
+        if key in cli_override_keys:
+            continue
         setattr(args, key, value)
 
 def getDatasetInfo(dataset):
