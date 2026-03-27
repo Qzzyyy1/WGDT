@@ -13,6 +13,8 @@ from utils.pyExt import dataToDevice
 from .DCRN import DCRN
 from .Prototype import PrototypeMemory
 from .UOT import UOTSolver
+from .Anchor import Anchor
+from utils.dann import DomainDiscriminator, DomainAdversarialLoss
 
 
 class Model(nn.Module):
@@ -29,6 +31,13 @@ class Model(nn.Module):
 
         self.feature_encoder = DCRN(in_channels, patch, known_num_classes)
         self.source_classifier = nn.Linear(288, known_num_classes)
+        self.anchor = Anchor(
+            known_num_classes,
+            anchor_weight=args.anchor_weight,
+            alpha=args.alpha,
+        )
+        self.disc_encoder = DomainDiscriminator(in_feature=288, hidden_size=args.dann_hidden_size)
+        self.domain_adv = DomainAdversarialLoss(self.disc_encoder)
         self.prototype_memory = PrototypeMemory(
             num_classes=known_num_classes,
             feat_dim=288,
@@ -65,6 +74,7 @@ class Model(nn.Module):
         self.best_oracle_hscore = float('-inf')
         self.oracle_loader = None
         self.uot_warmup_notice_printed = False
+        self.dann_warmup_notice_printed = False
 
     def get_unknown_threshold(self):
         return float(self.running_threshold.item())
@@ -173,11 +183,13 @@ class Model(nn.Module):
         logits = self.source_classifier(features)
         prediction = logits.argmax(dim=1)
         prototype_logits = self.prototype_memory.compute_logits(features)
+        anchor_out = self.anchor(logits, y) if y is not None else self.anchor(logits)
         out = {
             'features': features,
             'logits': logits,
             'prediction': prediction,
             'prototype_logits': prototype_logits,
+            **anchor_out,
         }
 
         if y is not None:
@@ -186,10 +198,14 @@ class Model(nn.Module):
         return out
     def forward_target(self, x):
         features = self.encode(x)
+        classifier_logits = self.source_classifier(features)
+        classifier_scores = torch.softmax(classifier_logits, dim=1)
         prototypes = self.prototype_memory.get_prototypes().detach()
         uot_out = self.uot_solver(prototypes, features)
         out = {
             'features': features,
+            'classifier_logits': classifier_logits,
+            'classifier_scores': classifier_scores,
             **uot_out,
         }
         return self.build_unknown_score(out)
@@ -203,13 +219,20 @@ class Model(nn.Module):
         x, y = batch
         epoch = self.progress.epoch if hasattr(self, 'progress') else 0
         out = self.forward_source(x, y, epoch=epoch, update_prototypes=True)
-        loss = out['loss_cls'] + self.args.prototype_loss_weight * out['loss_proto']
+        loss = (
+            out['loss_cls']
+            + self.args.prototype_loss_weight * out['loss_proto']
+            + self.args.anchor_aux_loss_weight * out['loss_anchor'] * self.args.alpha
+            + self.args.tuplet_aux_loss_weight * out['loss_tuplet']
+        )
         self.source_oa.update(out['prediction'], y)
         return {
             'loss': loss,
             'information': {
                 'loss_cls': out['loss_cls'],
                 'loss_proto': out['loss_proto'],
+                'loss_anchor': out['loss_anchor'] * self.args.alpha,
+                'loss_tuplet': out['loss_tuplet'],
             }
         }
 
@@ -249,10 +272,21 @@ class Model(nn.Module):
         uot_active = epoch >= self.args.uot_warmup_epochs
         loss_uot = target_out['loss'] * self.args.uot_loss_weight if uot_active else target_out['loss'] * 0.0
 
+        dann_active = epoch >= self.args.dann_warmup_epochs
+        target_weight = torch.clamp(1.0 - target_out['unknown_score'].detach(), min=self.args.dann_weight_low, max=self.args.dann_weight_high)
+        loss_disc = self.domain_adv(
+            source_out['features'],
+            target_out['features'],
+            w_t=target_weight.unsqueeze(1),
+        ) * self.args.domain_loss_weight if dann_active else target_out['loss'] * 0.0
+
         loss_dic = {
             'loss_cls': source_out['loss_cls'],
             'loss_proto': source_out['loss_proto'] * self.args.prototype_loss_weight,
+            'loss_anchor': source_out['loss_anchor'] * self.args.alpha * self.args.anchor_aux_loss_weight,
+            'loss_tuplet': source_out['loss_tuplet'] * self.args.tuplet_aux_loss_weight,
             'loss_uot': loss_uot,
+            'loss_disc': loss_disc,
         }
 
         self.source_oa.update(source_out['prediction'], source_y)
@@ -266,6 +300,9 @@ class Model(nn.Module):
             'target_dustbin_ratio': target_out['target_dustbin_ratio'],
             'source_threshold_batch': torch.quantile(source_uot_out['unknown_score'].detach(), self.args.threshold_quantile),
             'uot_active': float(uot_active),
+            'loss_disc_raw': self.domain_adv.domain_discriminator_accuracy if dann_active else 0.0,
+            'dann_active': float(dann_active),
+            'target_known_weight_mean': target_weight.mean(),
         }
         return {
             'loss': sum(value for value in loss_dic.values()),
@@ -278,6 +315,11 @@ class Model(nn.Module):
             self.uot_warmup_notice_printed = True
         if self.args.uot_warmup_epochs > 0 and (self.progress.epoch + 1) == self.args.uot_warmup_epochs:
             print('[UOT Warmup] Warmup finished. UOT alignment will start next epoch.')
+        if self.args.dann_warmup_epochs > 0 and not self.dann_warmup_notice_printed:
+            print(f'[DANN Warmup] `loss_disc=0.0` for the first {self.args.dann_warmup_epochs} epochs.')
+            self.dann_warmup_notice_printed = True
+        if self.args.dann_warmup_epochs > 0 and (self.progress.epoch + 1) == self.args.dann_warmup_epochs:
+            print('[DANN Warmup] Warmup finished. Confidence-weighted DANN will start next epoch.')
 
         threshold = self.update_running_threshold()
         target_dustbin_ratio = None
@@ -318,10 +360,10 @@ class Model(nn.Module):
     def train_optimizer(self):
         return torch.optim.SGD(
             [
-                {'params': self.feature_encoder.parameters()},
-                {'params': self.source_classifier.parameters()},
+                {'params': self.feature_encoder.parameters(), 'lr': self.args.lr_encoder},
+                {'params': self.source_classifier.parameters(), 'lr': self.args.lr_encoder},
+                {'params': self.disc_encoder.parameters(), 'lr': self.args.lr_domain if hasattr(self.args, 'lr_domain') else self.args.lr_encoder},
             ],
-            lr=self.args.lr_encoder,
             momentum=0.9,
             weight_decay=5e-4,
         )
@@ -405,6 +447,10 @@ def parse_args():
     parser.add_argument('--prototype_temperature', type=float, default=1.0)
     parser.add_argument('--prototype_warmup_epochs', type=int, default=5)
     parser.add_argument('--prototype_loss_weight', type=float, default=0.05)
+    parser.add_argument('--alpha', type=float, default=0.01)
+    parser.add_argument('--anchor_weight', type=float, default=10.0)
+    parser.add_argument('--anchor_aux_loss_weight', type=float, default=1.0)
+    parser.add_argument('--tuplet_aux_loss_weight', type=float, default=1.0)
 
     parser.add_argument('--uot_epsilon', type=float, default=0.05)
     parser.add_argument('--uot_tau_source', type=float, default=0.95)
@@ -414,6 +460,11 @@ def parse_args():
     parser.add_argument('--uot_loss_weight', type=float, default=1.0)
     parser.add_argument('--uot_no_grad', type=str, default='True')
     parser.add_argument('--uot_warmup_epochs', type=int, default=0)
+    parser.add_argument('--domain_loss_weight', type=float, default=0.1)
+    parser.add_argument('--dann_hidden_size', type=int, default=64)
+    parser.add_argument('--dann_warmup_epochs', type=int, default=5)
+    parser.add_argument('--dann_weight_low', type=float, default=0.05)
+    parser.add_argument('--dann_weight_high', type=float, default=0.95)
 
     parser.add_argument('--dustbin_quantile', type=float, default=0.8)
     parser.add_argument('--dustbin_beta', type=float, default=0.95)
