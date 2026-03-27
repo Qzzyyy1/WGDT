@@ -7,7 +7,7 @@ from utils.file import check_path
 from utils.meter import OpensetDomainMetric, computeOpensetDomainResult
 from utils.Trainer import Trainer
 from utils.dataLoader import CombinedLoader
-from utils.open_set import predict_open_set, fuse_unknown_score
+from utils.open_set import predict_open_set, predict_open_set_transport, fuse_unknown_score
 from utils.utils import mergeArgs, getCliOverrideKeys
 from utils.pyExt import dataToDevice
 from .DCRN import DCRN
@@ -45,6 +45,10 @@ class Model(nn.Module):
             dustbin_quantile=args.dustbin_quantile,
             dustbin_beta=args.dustbin_beta,
             dustbin_mass_prior=args.dustbin_mass_prior,
+            dustbin_cost_mode=args.dustbin_cost_mode,
+            dustbin_cost_value=args.dustbin_cost_value,
+            dustbin_source_quantile=args.dustbin_source_quantile,
+            dustbin_source_margin=args.dustbin_source_margin,
             use_no_grad=args.uot_no_grad == 'True',
         )
 
@@ -59,9 +63,23 @@ class Model(nn.Module):
         self.target_dustbin_ratio_list = []
         self.best_oracle_hscore = float('-inf')
         self.oracle_loader = None
+        self.uot_warmup_notice_printed = False
 
     def get_unknown_threshold(self):
         return float(self.running_threshold.item())
+
+    def predict_target(self, out):
+        if self.args.open_set_decision == 'transport':
+            return predict_open_set_transport(
+                out['transport_plan'],
+                self.known_num_classes,
+            )
+        return predict_open_set(
+            out['class_scores'],
+            out['unknown_score'],
+            self.get_unknown_threshold(),
+            self.known_num_classes,
+        )
 
     def build_unknown_score(self, out):
         out['unknown_score'] = fuse_unknown_score(
@@ -127,12 +145,7 @@ class Model(nn.Module):
             for data in self.oracle_loader:
                 x, y = dataToDevice(data, self.device)
                 out = self.forward_target(x)
-                prediction = predict_open_set(
-                    out['class_scores'],
-                    out['unknown_score'],
-                    self.get_unknown_threshold(),
-                    self.known_num_classes,
-                )
+                prediction = self.predict_target(out)
                 prediction_list.append(prediction.detach().cpu())
                 target_list.append(y.detach().cpu())
                 unknown_score_list.append(out['unknown_score'].detach().cpu())
@@ -218,16 +231,24 @@ class Model(nn.Module):
         epoch = self.progress.epoch if hasattr(self, 'progress') else 0
 
         source_out = self.forward_source(source_x, source_y, epoch=epoch, update_prototypes=True)
+        self.uot_solver.update_source_calibration(
+            self.prototype_memory.get_prototypes().detach(),
+            source_out['features'].detach(),
+            source_y,
+        )
         source_uot_out = self.forward_uot_by_features(source_out['features'].detach())
         target_out = self.forward_target(target_x)
 
         self.source_dustbin_score_list.append(source_uot_out['unknown_score'].detach().cpu())
         self.target_dustbin_ratio_list.append(target_out['target_dustbin_ratio'].detach().cpu())
 
+        uot_active = epoch >= self.args.uot_warmup_epochs
+        loss_uot = target_out['loss'] * self.args.uot_loss_weight if uot_active else target_out['loss'] * 0.0
+
         loss_dic = {
             'loss_cls': source_out['loss_cls'],
             'loss_proto': source_out['loss_proto'] * self.args.prototype_loss_weight,
-            'loss_uot': target_out['loss'] * self.args.uot_loss_weight,
+            'loss_uot': loss_uot,
         }
 
         self.source_oa.update(source_out['prediction'], source_y)
@@ -240,6 +261,7 @@ class Model(nn.Module):
             'dustbin_mass_prior': target_out['dustbin_mass_prior'],
             'target_dustbin_ratio': target_out['target_dustbin_ratio'],
             'source_threshold_batch': torch.quantile(source_uot_out['unknown_score'].detach(), self.args.threshold_quantile),
+            'uot_active': float(uot_active),
         }
         return {
             'loss': sum(value for value in loss_dic.values()),
@@ -247,6 +269,12 @@ class Model(nn.Module):
         }
 
     def train_epoch_end(self):
+        if self.args.uot_warmup_epochs > 0 and not self.uot_warmup_notice_printed:
+            print(f'[UOT Warmup] `loss_uot=0.0` for the first {self.args.uot_warmup_epochs} epochs.')
+            self.uot_warmup_notice_printed = True
+        if self.args.uot_warmup_epochs > 0 and (self.progress.epoch + 1) == self.args.uot_warmup_epochs:
+            print('[UOT Warmup] Warmup finished. UOT alignment will start next epoch.')
+
         threshold = self.update_running_threshold()
         target_dustbin_ratio = None
         if len(self.target_dustbin_ratio_list) > 0:
@@ -294,12 +322,7 @@ class Model(nn.Module):
     def test_step(self, batch):
         x, y = batch
         out = self.forward_target(x)
-        prediction = predict_open_set(
-            out['class_scores'],
-            out['unknown_score'],
-            self.get_unknown_threshold(),
-            self.known_num_classes,
-        )
+        prediction = self.predict_target(out)
         self.metric.update(prediction, y, out['unknown_score'])
 
     def test_end(self):
@@ -308,12 +331,7 @@ class Model(nn.Module):
     def prediction_step(self, batch):
         x = batch
         out = self.forward_target(x)
-        prediction = predict_open_set(
-            out['class_scores'],
-            out['unknown_score'],
-            self.get_unknown_threshold(),
-            self.known_num_classes,
-        )
+        prediction = self.predict_target(out)
         self.prediciton_all.append(prediction)
 
     def prediction_end(self):
@@ -389,17 +407,24 @@ def parse_args():
     parser.add_argument('--uot_metric', type=str, choices=['euclidean', 'cosine'], default='euclidean')
     parser.add_argument('--uot_loss_weight', type=float, default=1.0)
     parser.add_argument('--uot_no_grad', type=str, default='True')
+    parser.add_argument('--uot_warmup_epochs', type=int, default=0)
 
     parser.add_argument('--dustbin_quantile', type=float, default=0.8)
     parser.add_argument('--dustbin_beta', type=float, default=0.95)
     parser.add_argument('--dustbin_mass_prior', type=float, default=0.05)
+    parser.add_argument('--dustbin_cost_mode', type=str, choices=['source_quantile', 'absolute', 'target_quantile'], default='source_quantile')
+    parser.add_argument('--dustbin_cost_value', type=float, default=0.6)
+    parser.add_argument('--dustbin_source_quantile', type=float, default=0.95)
+    parser.add_argument('--dustbin_source_margin', type=float, default=0.1)
     parser.add_argument('--unknown_threshold', type=float, default=0.5)
     parser.add_argument('--threshold_quantile', type=float, default=0.95)
     parser.add_argument('--threshold_ema', type=float, default=0.9)
     parser.add_argument('--save_last_checkpoint', type=str, default='True')
     parser.add_argument('--save_best_oracle_checkpoint', type=str, default='True')
     parser.add_argument('--unknown_score_alpha', type=float, default=0.5)
+    parser.add_argument('--open_set_decision', type=str, choices=['threshold', 'transport'], default='threshold')
 
     args = parser.parse_args()
     mergeArgs(args, args.target_dataset, getCliOverrideKeys())
     return args
+

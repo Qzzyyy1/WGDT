@@ -6,7 +6,9 @@ import torch.nn.functional as F
 class UOTSolver(nn.Module):
     def __init__(self, epsilon=0.05, tau_source=0.95, tau_target=0.95, max_iter=30,
                  metric='euclidean', dustbin_quantile=0.8, dustbin_beta=0.95,
-                 dustbin_mass_prior=0.05, use_no_grad=True, eps=1e-8):
+                 dustbin_mass_prior=0.05, dustbin_cost_mode='source_quantile',
+                 dustbin_cost_value=0.6, dustbin_source_quantile=0.95,
+                 dustbin_source_margin=0.1, use_no_grad=True, eps=1e-8):
         super().__init__()
 
         self.epsilon = epsilon
@@ -17,10 +19,14 @@ class UOTSolver(nn.Module):
         self.dustbin_quantile = dustbin_quantile
         self.dustbin_beta = dustbin_beta
         self.dustbin_mass_prior = dustbin_mass_prior
+        self.dustbin_cost_mode = dustbin_cost_mode
+        self.dustbin_cost_value = dustbin_cost_value
+        self.dustbin_source_quantile = dustbin_source_quantile
+        self.dustbin_source_margin = dustbin_source_margin
         self.use_no_grad = use_no_grad
         self.eps = eps
 
-        self.register_buffer('dustbin_cost_ema', torch.tensor(0.0))
+        self.register_buffer('dustbin_cost_ema', torch.tensor(float(dustbin_cost_value)))
         self.register_buffer('dustbin_initialized', torch.tensor(False, dtype=torch.bool))
 
     def distance_unknown_score(self, min_distance, dustbin_cost):
@@ -29,23 +35,52 @@ class UOTSolver(nn.Module):
         return torch.sigmoid(distance_margin / temperature)
 
     def pairwise_cost(self, source_proto, target_feat):
+        source_proto = F.normalize(source_proto, p=2, dim=-1)
+        target_feat = F.normalize(target_feat, p=2, dim=-1)
+
         if self.metric == 'cosine':
-            source_proto = F.normalize(source_proto, p=2, dim=-1)
-            target_feat = F.normalize(target_feat, p=2, dim=-1)
             similarity = torch.matmul(source_proto, target_feat.transpose(0, 1))
             return 1.0 - similarity
-        return torch.cdist(source_proto, target_feat)
+        return torch.cdist(source_proto, target_feat).clamp(0.0, 2.0)
+
+    @torch.no_grad()
+    def update_source_calibration(self, source_proto, source_feat, source_label):
+        if source_feat.numel() == 0:
+            return self.dustbin_cost_ema
+
+        cost = self.pairwise_cost(source_proto.detach(), source_feat.detach())
+        batch_index = torch.arange(source_label.size(0), device=source_label.device)
+        gt_distance = cost[source_label.long(), batch_index]
+        current_cost = torch.quantile(gt_distance, self.dustbin_source_quantile)
+        current_cost = (current_cost + self.dustbin_source_margin).clamp(min=self.eps, max=2.0)
+
+        if not self.dustbin_initialized:
+            self.dustbin_cost_ema.copy_(current_cost)
+            self.dustbin_initialized.fill_(True)
+        else:
+            ema_cost = self.dustbin_beta * self.dustbin_cost_ema + (1.0 - self.dustbin_beta) * current_cost
+            self.dustbin_cost_ema.copy_(ema_cost)
+        return self.dustbin_cost_ema
 
     @torch.no_grad()
     def estimate_dustbin_cost(self, cost):
-        q_batch = torch.quantile(cost.detach().reshape(-1), self.dustbin_quantile)
-        if not self.dustbin_initialized:
-            self.dustbin_cost_ema.copy_(q_batch)
-            self.dustbin_initialized.fill_(True)
-        else:
-            ema_cost = self.dustbin_beta * self.dustbin_cost_ema + (1.0 - self.dustbin_beta) * q_batch
-            self.dustbin_cost_ema.copy_(ema_cost)
-        return self.dustbin_beta * self.dustbin_cost_ema + (1.0 - self.dustbin_beta) * q_batch
+        if self.dustbin_cost_mode == 'absolute':
+            return torch.tensor(float(self.dustbin_cost_value), device=cost.device, dtype=cost.dtype)
+
+        if self.dustbin_cost_mode == 'source_quantile' and self.dustbin_initialized:
+            return self.dustbin_cost_ema.to(device=cost.device, dtype=cost.dtype)
+
+        if self.dustbin_cost_mode == 'target_quantile':
+            q_batch = torch.quantile(cost.detach().reshape(-1), self.dustbin_quantile)
+            if not self.dustbin_initialized:
+                self.dustbin_cost_ema.copy_(q_batch)
+                self.dustbin_initialized.fill_(True)
+            else:
+                ema_cost = self.dustbin_beta * self.dustbin_cost_ema + (1.0 - self.dustbin_beta) * q_batch
+                self.dustbin_cost_ema.copy_(ema_cost)
+            return self.dustbin_cost_ema.to(device=cost.device, dtype=cost.dtype)
+
+        return torch.tensor(float(self.dustbin_cost_value), device=cost.device, dtype=cost.dtype)
 
     def append_dustbin(self, cost, dustbin_cost):
         dustbin_row = torch.full((1, cost.size(1)), float(dustbin_cost), device=cost.device, dtype=cost.dtype)
@@ -105,7 +140,9 @@ class UOTSolver(nn.Module):
         else:
             transport_plan = self.sinkhorn_unbalanced(cost_ext, source_mass, target_mass)
 
-        loss = (transport_plan.detach() * cost_ext).sum()
+        known_plan = transport_plan[:-1].detach()
+        batch_size = max(cost.size(1), 1)
+        loss = (known_plan * cost).sum() / batch_size
         scores = self.extract_scores(transport_plan.detach())
         target_dustbin_ratio = transport_plan[-1].sum() / transport_plan.sum().clamp_min(self.eps)
         return {

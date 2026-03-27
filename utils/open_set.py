@@ -30,3 +30,12 @@ def predict_open_set(class_scores, unknown_score, threshold, unknown_index):
     prediction = prediction.clone()
     prediction[unknown_score >= threshold] = unknown_index
     return prediction
+
+
+def predict_open_set_transport(transport_plan, unknown_index):
+    assignment = transport_plan.argmax(dim=0)
+    prediction = assignment.clone()
+    dustbin_index = transport_plan.size(0) - 1
+    prediction[assignment == dustbin_index] = unknown_index
+    prediction[prediction > unknown_index] = unknown_index
+    return prediction.long()
