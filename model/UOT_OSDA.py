@@ -100,6 +100,45 @@ class Model(nn.Module):
             return 1.0
         return self.args.source_decay_factor
 
+    def compute_soft_dann_target_weights(self, out):
+        distance_matrix = self.compute_feature_prototype_distance(out['features'])
+        top_dists, top_indices = distance_matrix.topk(2, dim=1, largest=False)
+        d1 = top_dists[:, 0]
+        d2 = top_dists[:, 1]
+        top1_class = top_indices[:, 0]
+
+        candidate_radius = self.class_radius[top1_class] * self.args.radius_margin
+        candidate_radius_initialized = self.class_radius_initialized[top1_class]
+
+        tau_close = max(float(self.args.tau_close), 1e-6)
+        tau_margin = max(float(self.args.tau_margin), 1e-6)
+
+        with torch.no_grad():
+            w_open = 1.0 - out['unknown_score'].detach()
+            w_close_raw = torch.sigmoid((candidate_radius.detach() - d1.detach()) / tau_close)
+            w_close = torch.where(
+                candidate_radius_initialized,
+                w_close_raw,
+                torch.ones_like(w_close_raw),
+            )
+            margin_gap = d2.detach() - d1.detach()
+            w_margin = torch.sigmoid((margin_gap - self.args.tgt_margin_value) / tau_margin)
+            w_target = (w_open * w_close * w_margin).pow(1.0 / 3.0)
+
+        return {
+            'distance_matrix': distance_matrix,
+            'd1': d1,
+            'd2': d2,
+            'top1_class': top1_class,
+            'candidate_radius': candidate_radius,
+            'candidate_radius_initialized': candidate_radius_initialized,
+            'margin_gap': d2 - d1,
+            'w_open': w_open,
+            'w_close': w_close,
+            'w_margin': w_margin,
+            'w_target': w_target,
+        }
+
     def get_target_gate_state(self, out):
         distance_matrix = self.compute_feature_prototype_distance(out['features'])
         candidate_preds = out['class_scores'].argmax(dim=1)
@@ -368,7 +407,8 @@ class Model(nn.Module):
 
         dann_stop_reached = self.args.dann_stop_epochs > 0 and epoch >= self.args.dann_stop_epochs
         dann_active = epoch >= self.args.dann_warmup_epochs and not dann_stop_reached
-        target_weight = torch.clamp(1.0 - target_out['unknown_score'].detach(), min=self.args.dann_weight_low, max=self.args.dann_weight_high)
+        soft_dann_state = self.compute_soft_dann_target_weights(target_out)
+        target_weight = soft_dann_state['w_target']
         loss_disc = self.domain_adv(
             source_out['features'],
             target_out['features'],
@@ -420,6 +460,11 @@ class Model(nn.Module):
             'loss_disc_raw': self.domain_adv.domain_discriminator_accuracy if dann_active else 0.0,
             'dann_active': float(dann_active),
             'target_known_weight_mean': target_weight.mean(),
+            'w_open_mean': soft_dann_state['w_open'].mean(),
+            'w_close_mean': soft_dann_state['w_close'].mean(),
+            'w_margin_mean': soft_dann_state['w_margin'].mean(),
+            'w_target_mean': soft_dann_state['w_target'].mean(),
+            'w_target_std': soft_dann_state['w_target'].std(),
             'tgt_proto_active': float(tgt_proto_active),
             'source_decay_factor': float(source_decay_factor),
             'prototype_update_active': source_out.get('prototype_update_active', 0.0),
@@ -611,6 +656,8 @@ def parse_args():
     parser.add_argument('--tgt_proto_loss_weight', type=float, default=0.02)
     parser.add_argument('--tgt_margin_loss_weight', type=float, default=0.05)
     parser.add_argument('--tgt_margin_value', type=float, default=0.1)
+    parser.add_argument('--tau_close', type=float, default=0.05)
+    parser.add_argument('--tau_margin', type=float, default=0.05)
     parser.add_argument('--proto_update_stop_epoch', type=int, default=10)
     parser.add_argument('--source_decay_epoch', type=int, default=10)
     parser.add_argument('--source_decay_factor', type=float, default=0.05)
