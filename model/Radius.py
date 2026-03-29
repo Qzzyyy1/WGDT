@@ -23,4 +23,4 @@ class Radius(nn.Module):
         return self.loss(self.radius, x, torch.ones_like(x, device=x.device))
     
     def margin_mse_loss(self, x: torch.Tensor, weight: Optional[torch.Tensor] = None) -> torch.Tensor:
-        return self.loss(self.radius, x, weight)
+        return self.loss(self.radius.expand_as(x), x, weight)

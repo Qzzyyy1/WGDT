@@ -1,4 +1,4 @@
-import os
+import copy
 import os
 import torch
 import torch.nn as nn
@@ -87,6 +87,17 @@ class Model(nn.Module):
         self.dann_warmup_notice_printed = False
         self.dann_stop_notice_printed = False
 
+        self.use_ema_teacher = args.use_ema_teacher == 'True'
+        self.teacher_initialized = False
+        if self.use_ema_teacher:
+            self.teacher_feature_encoder = copy.deepcopy(self.feature_encoder)
+            self.teacher_prototype_memory = copy.deepcopy(self.prototype_memory)
+            self._freeze_teacher_modules()
+            self.sync_teacher_from_student()
+        else:
+            self.teacher_feature_encoder = None
+            self.teacher_prototype_memory = None
+
     def get_unknown_threshold(self):
         return float(self.running_threshold.item())
 
@@ -105,6 +116,46 @@ class Model(nn.Module):
         if self.args.source_decay_epoch < 0 or epoch < self.args.source_decay_epoch:
             return 1.0
         return self.args.source_decay_factor
+
+    def _freeze_teacher_modules(self):
+        if not self.use_ema_teacher:
+            return
+        for parameter in self.teacher_feature_encoder.parameters():
+            parameter.requires_grad = False
+        self.teacher_feature_encoder.eval()
+
+    @torch.no_grad()
+    def sync_teacher_from_student(self):
+        if not self.use_ema_teacher:
+            return
+        self.teacher_feature_encoder.load_state_dict(self.feature_encoder.state_dict())
+        self.teacher_prototype_memory.load_state_dict(self.prototype_memory.state_dict())
+        self.teacher_feature_encoder.eval()
+        self.teacher_initialized = True
+
+    @torch.no_grad()
+    def update_ema_teacher(self):
+        if not self.use_ema_teacher:
+            return
+        if not self.teacher_initialized:
+            self.sync_teacher_from_student()
+            return
+
+        momentum = float(self.args.teacher_momentum)
+        for teacher_param, student_param in zip(self.teacher_feature_encoder.parameters(), self.feature_encoder.parameters()):
+            teacher_param.data.mul_(momentum).add_(student_param.data, alpha=1.0 - momentum)
+        for teacher_buffer, student_buffer in zip(self.teacher_feature_encoder.buffers(), self.feature_encoder.buffers()):
+            if torch.is_floating_point(teacher_buffer):
+                teacher_buffer.data.mul_(momentum).add_(student_buffer.data, alpha=1.0 - momentum)
+            else:
+                teacher_buffer.data.copy_(student_buffer.data)
+
+        if bool(self.teacher_prototype_memory.initialized.any().item()):
+            self.teacher_prototype_memory.prototypes.mul_(momentum).add_(self.prototype_memory.prototypes, alpha=1.0 - momentum)
+        else:
+            self.teacher_prototype_memory.prototypes.copy_(self.prototype_memory.prototypes)
+        self.teacher_prototype_memory.initialized.copy_(self.teacher_prototype_memory.initialized | self.prototype_memory.initialized)
+        self.teacher_feature_encoder.eval()
 
     def compute_soft_dann_target_weights(self, out):
         distance_matrix = self.compute_feature_prototype_distance(out['features'])
@@ -145,33 +196,51 @@ class Model(nn.Module):
             'w_target': w_target,
         }
 
-    def compute_transport_barycenter_state(self, out):
+    def compute_transport_barycenter_state(self, out, teacher_out=None):
         eps = 1e-8
         feature_norm = F.normalize(out['features'], p=2, dim=1)
+        reference_out = teacher_out if teacher_out is not None else out
 
         with torch.no_grad():
-            prototypes = self.prototype_memory.get_prototypes().detach()
-            known_transport = out['transport_plan'][:-1].transpose(0, 1)
+            if teacher_out is not None and self.use_ema_teacher and self.teacher_prototype_memory is not None:
+                prototypes = self.teacher_prototype_memory.get_prototypes().detach()
+            else:
+                prototypes = self.prototype_memory.get_prototypes().detach()
+            known_transport = reference_out['transport_plan'][:-1].transpose(0, 1)
             known_mass = known_transport.sum(dim=1)
             class_posterior = known_transport / known_mass.unsqueeze(1).clamp_min(eps)
-            barycenter_raw = torch.matmul(class_posterior, prototypes)
+            sharpen_t = max(float(self.args.barycenter_sharpen_t), 1e-6)
+            sharp_posterior = class_posterior.pow(1.0 / sharpen_t)
+            sharp_posterior = sharp_posterior / sharp_posterior.sum(dim=1, keepdim=True).clamp_min(eps)
+            barycenter_raw = torch.matmul(sharp_posterior, prototypes)
             barycenter_raw_norm = barycenter_raw.norm(p=2, dim=1)
             barycenter = F.normalize(barycenter_raw, p=2, dim=1, eps=eps)
+            posterior_confidence = class_posterior.max(dim=1)[0]
+            clean_weight = known_mass.detach() * posterior_confidence.detach()
+            open_set_confidence = 1.0 - reference_out['unknown_score'].detach()
+            ultimate_weight = clean_weight * open_set_confidence
 
         barycenter_distance = 0.5 * (feature_norm - barycenter.detach()).pow(2).sum(dim=1)
         loss_raw = (
-            known_mass.detach() * barycenter_distance
-        ).sum() / known_mass.detach().sum().clamp_min(eps)
+            ultimate_weight * barycenter_distance
+        ).sum() / ultimate_weight.sum().clamp_min(eps)
 
         return {
             'known_transport': known_transport,
             'known_mass': known_mass,
+            'clean_weight': clean_weight,
+            'ultimate_weight': ultimate_weight,
+            'open_set_confidence': open_set_confidence,
+            'posterior_confidence': posterior_confidence,
             'class_posterior': class_posterior,
+            'sharp_posterior': sharp_posterior,
             'feature_norm': feature_norm,
             'barycenter': barycenter,
             'barycenter_raw_norm': barycenter_raw_norm,
             'barycenter_distance': barycenter_distance,
             'loss_raw': loss_raw,
+            'teacher_used': float(teacher_out is not None),
+            'reference_unknown_score_mean': reference_out['unknown_score'].mean().detach(),
         }
 
     def get_target_gate_state(self, out):
@@ -217,10 +286,9 @@ class Model(nn.Module):
                 self.known_num_classes,
             )
         if self.args.open_set_decision == 'radius':
-            barycenter_state = self.compute_transport_barycenter_state(out)
             prediction = out['class_scores'].argmax(dim=1)
             prediction = prediction.clone()
-            prediction[barycenter_state['barycenter_distance'] > self.radius.radius.detach()] = self.known_num_classes
+            prediction[out['unknown_score'] > self.radius.radius.detach()] = self.known_num_classes
             return prediction
         gate_state = self.get_target_gate_state(out)
         prediction = gate_state['candidate_preds'].clone()
@@ -228,8 +296,6 @@ class Model(nn.Module):
         return prediction
 
     def get_eval_unknown_score(self, out):
-        if self.args.open_set_decision == 'radius':
-            return self.compute_transport_barycenter_state(out)['barycenter_distance'].detach()
         return out['unknown_score']
 
     def build_unknown_score(self, out):
@@ -389,6 +455,22 @@ class Model(nn.Module):
         }
         return self.build_unknown_score(out)
 
+    @torch.no_grad()
+    def forward_target_teacher(self, x):
+        if not self.use_ema_teacher:
+            return None
+        if not self.teacher_initialized:
+            self.sync_teacher_from_student()
+        self.teacher_feature_encoder.eval()
+        features = self.teacher_feature_encoder(x)['features']
+        prototypes = self.teacher_prototype_memory.get_prototypes().detach()
+        uot_out = self.uot_solver(prototypes, features)
+        out = {
+            'features': features,
+            **uot_out,
+        }
+        return self.build_unknown_score(out)
+
     def forward_uot_by_features(self, features):
         prototypes = self.prototype_memory.get_prototypes().detach()
         out = self.uot_solver(prototypes, features)
@@ -437,6 +519,8 @@ class Model(nn.Module):
         epoch = self.progress.epoch if hasattr(self, 'progress') else 0
 
         source_out = self.forward_source(source_x, source_y, epoch=epoch, update_prototypes=True)
+        if self.use_ema_teacher:
+            self.update_ema_teacher()
         self.uot_solver.update_source_calibration(
             self.prototype_memory.get_prototypes().detach(),
             source_out['features'].detach(),
@@ -444,6 +528,7 @@ class Model(nn.Module):
         )
         source_uot_out = self.forward_uot_by_features(source_out['features'].detach())
         target_out = self.forward_target(target_x)
+        target_teacher_out = self.forward_target_teacher(target_x) if self.use_ema_teacher else None
 
         self.source_dustbin_score_list.append(source_uot_out['unknown_score'].detach().cpu())
         self.target_dustbin_ratio_list.append(target_out['target_dustbin_ratio'].detach().cpu())
@@ -461,14 +546,14 @@ class Model(nn.Module):
             w_t=target_weight.unsqueeze(1),
         ) * self.args.domain_loss_weight if dann_active else target_out['loss'] * 0.0
 
-        barycenter_state = self.compute_transport_barycenter_state(target_out)
+        barycenter_state = self.compute_transport_barycenter_state(target_out, teacher_out=target_teacher_out)
         barycenter_active = epoch >= self.args.barycenter_warmup_epochs
         loss_bary_raw = barycenter_state['loss_raw']
         loss_bary = loss_bary_raw * self.args.barycenter_loss_weight if barycenter_active else target_out['loss'] * 0.0
         radius_active = epoch >= self.args.radius_warmup_epochs
         loss_radius_raw = self.radius(
-            barycenter_state['barycenter_distance'].detach(),
-            weight=barycenter_state['known_mass'].detach(),
+            target_out['unknown_score'].detach(),
+            weight=barycenter_state['ultimate_weight'].detach(),
         )
         loss_radius = loss_radius_raw * self.args.radius_loss_weight if radius_active else target_out['loss'] * 0.0
 
@@ -524,6 +609,9 @@ class Model(nn.Module):
             'w_margin_mean': soft_dann_state['w_margin'].mean(),
             'w_target_mean': soft_dann_state['w_target'].mean(),
             'w_target_std': soft_dann_state['w_target'].std(),
+            'ema_teacher_active': float(target_teacher_out is not None),
+            'teacher_unknown_score_mean': target_teacher_out['unknown_score'].mean() if target_teacher_out is not None else target_out['unknown_score'].new_zeros(()),
+            'teacher_student_unknown_gap': (target_teacher_out['unknown_score'] - target_out['unknown_score'].detach()).abs().mean() if target_teacher_out is not None else target_out['unknown_score'].new_zeros(()),
             'barycenter_active': float(barycenter_active),
             'loss_bary_raw': loss_bary_raw.detach(),
             'radius_active': float(radius_active),
@@ -531,8 +619,16 @@ class Model(nn.Module):
             'learnable_radius': self.radius.radius.detach(),
             'known_mass_mean': barycenter_state['known_mass'].mean(),
             'known_mass_std': barycenter_state['known_mass'].std(),
+            'clean_weight_mean': barycenter_state['clean_weight'].mean(),
+            'open_set_conf_mean': barycenter_state['open_set_confidence'].mean(),
+            'ultimate_weight_mean': barycenter_state['ultimate_weight'].mean(),
+            'posterior_confidence_mean': barycenter_state['posterior_confidence'].mean(),
+            'posterior_confidence_std': barycenter_state['posterior_confidence'].std(),
+            'sharp_posterior_max_mean': barycenter_state['sharp_posterior'].max(dim=1)[0].mean(),
             'barycenter_raw_norm_mean': barycenter_state['barycenter_raw_norm'].mean(),
             'barycenter_dist_mean': barycenter_state['barycenter_distance'].mean().detach(),
+            'teacher_used_for_barycenter': barycenter_state['teacher_used'],
+            'reference_unknown_score_mean': barycenter_state['reference_unknown_score_mean'],
             'adapt_cls_loss_weight': float(self.args.adapt_cls_loss_weight),
             'adapt_proto_loss_weight': float(self.args.adapt_proto_loss_weight),
             'adapt_anchor_loss_weight': float(self.args.adapt_anchor_loss_weight),
@@ -705,7 +801,7 @@ def parse_args():
 
     parser.add_argument('--prototype_momentum', type=float, default=0.99)
     parser.add_argument('--prototype_temperature', type=float, default=1.0)
-    parser.add_argument('--prototype_warmup_epochs', type=int, default=5)
+    parser.add_argument('--prototype_warmup_epochs', type=int, default=0)
     parser.add_argument('--prototype_loss_weight', type=float, default=0.05)
     parser.add_argument('--alpha', type=float, default=0.01)
     parser.add_argument('--anchor_weight', type=float, default=10.0)
@@ -739,6 +835,7 @@ def parse_args():
     parser.add_argument('--radius_loss_weight', type=float, default=0.0)
     parser.add_argument('--learnable_radius_init', type=float, default=0.0)
     parser.add_argument('--learnable_radius_margin', type=float, default=0.1)
+    parser.add_argument('--barycenter_sharpen_t', type=float, default=0.5)
     parser.add_argument('--adapt_cls_loss_weight', type=float, default=1.0)
     parser.add_argument('--adapt_proto_loss_weight', type=float, default=1.0)
     parser.add_argument('--adapt_anchor_loss_weight', type=float, default=1.0)
@@ -746,6 +843,8 @@ def parse_args():
     parser.add_argument('--train_lr_encoder', type=float, default=-1.0)
     parser.add_argument('--train_lr_domain', type=float, default=-1.0)
     parser.add_argument('--train_lr_radius', type=float, default=-1.0)
+    parser.add_argument('--use_ema_teacher', type=str, default='False')
+    parser.add_argument('--teacher_momentum', type=float, default=0.999)
     parser.add_argument('--tau_close', type=float, default=0.05)
     parser.add_argument('--tau_margin', type=float, default=0.05)
     parser.add_argument('--proto_update_stop_epoch', type=int, default=10)
@@ -770,4 +869,6 @@ def parse_args():
     args = parser.parse_args()
     mergeArgs(args, args.target_dataset, getCliOverrideKeys())
     return args
+
+
 
