@@ -16,6 +16,7 @@ from .DCRN import DCRN
 from .Prototype import PrototypeMemory
 from .UOT import UOTSolver
 from .Anchor import Anchor
+from .Radius import Radius
 from utils.dann import DomainDiscriminator, DomainAdversarialLoss
 
 
@@ -37,6 +38,11 @@ class Model(nn.Module):
             known_num_classes,
             anchor_weight=args.anchor_weight,
             alpha=args.alpha,
+        )
+        self.radius = Radius(
+            args.learnable_radius_init,
+            args.learnable_radius_margin,
+            'MarginMSELoss',
         )
         self.disc_encoder = DomainDiscriminator(in_feature=288, hidden_size=args.dann_hidden_size)
         self.domain_adv = DomainAdversarialLoss(self.disc_encoder)
@@ -139,6 +145,35 @@ class Model(nn.Module):
             'w_target': w_target,
         }
 
+    def compute_transport_barycenter_state(self, out):
+        eps = 1e-8
+        feature_norm = F.normalize(out['features'], p=2, dim=1)
+
+        with torch.no_grad():
+            prototypes = self.prototype_memory.get_prototypes().detach()
+            known_transport = out['transport_plan'][:-1].transpose(0, 1)
+            known_mass = known_transport.sum(dim=1)
+            class_posterior = known_transport / known_mass.unsqueeze(1).clamp_min(eps)
+            barycenter_raw = torch.matmul(class_posterior, prototypes)
+            barycenter_raw_norm = barycenter_raw.norm(p=2, dim=1)
+            barycenter = F.normalize(barycenter_raw, p=2, dim=1, eps=eps)
+
+        barycenter_distance = 0.5 * (feature_norm - barycenter.detach()).pow(2).sum(dim=1)
+        loss_raw = (
+            known_mass.detach() * barycenter_distance
+        ).sum() / known_mass.detach().sum().clamp_min(eps)
+
+        return {
+            'known_transport': known_transport,
+            'known_mass': known_mass,
+            'class_posterior': class_posterior,
+            'feature_norm': feature_norm,
+            'barycenter': barycenter,
+            'barycenter_raw_norm': barycenter_raw_norm,
+            'barycenter_distance': barycenter_distance,
+            'loss_raw': loss_raw,
+        }
+
     def get_target_gate_state(self, out):
         distance_matrix = self.compute_feature_prototype_distance(out['features'])
         candidate_preds = out['class_scores'].argmax(dim=1)
@@ -181,10 +216,21 @@ class Model(nn.Module):
                 out['transport_plan'],
                 self.known_num_classes,
             )
+        if self.args.open_set_decision == 'radius':
+            barycenter_state = self.compute_transport_barycenter_state(out)
+            prediction = out['class_scores'].argmax(dim=1)
+            prediction = prediction.clone()
+            prediction[barycenter_state['barycenter_distance'] > self.radius.radius.detach()] = self.known_num_classes
+            return prediction
         gate_state = self.get_target_gate_state(out)
         prediction = gate_state['candidate_preds'].clone()
         prediction[gate_state['final_unknown']] = self.known_num_classes
         return prediction
+
+    def get_eval_unknown_score(self, out):
+        if self.args.open_set_decision == 'radius':
+            return self.compute_transport_barycenter_state(out)['barycenter_distance'].detach()
+        return out['unknown_score']
 
     def build_unknown_score(self, out):
         out['unknown_score'] = fuse_unknown_score(
@@ -415,6 +461,17 @@ class Model(nn.Module):
             w_t=target_weight.unsqueeze(1),
         ) * self.args.domain_loss_weight if dann_active else target_out['loss'] * 0.0
 
+        barycenter_state = self.compute_transport_barycenter_state(target_out)
+        barycenter_active = epoch >= self.args.barycenter_warmup_epochs
+        loss_bary_raw = barycenter_state['loss_raw']
+        loss_bary = loss_bary_raw * self.args.barycenter_loss_weight if barycenter_active else target_out['loss'] * 0.0
+        radius_active = epoch >= self.args.radius_warmup_epochs
+        loss_radius_raw = self.radius(
+            barycenter_state['barycenter_distance'].detach(),
+            weight=barycenter_state['known_mass'].detach(),
+        )
+        loss_radius = loss_radius_raw * self.args.radius_loss_weight if radius_active else target_out['loss'] * 0.0
+
         source_decay_factor = self.get_source_decay_factor(epoch)
 
         gate_state = self.get_target_gate_state(target_out)
@@ -436,12 +493,14 @@ class Model(nn.Module):
         loss_tgt_margin = loss_tgt_margin_raw * self.args.tgt_margin_loss_weight if tgt_proto_active else target_out['loss'] * 0.0
 
         loss_dic = {
-            'loss_cls': source_out['loss_cls'] * source_decay_factor,
-            'loss_proto': source_out['loss_proto'] * self.args.prototype_loss_weight * source_decay_factor,
-            'loss_anchor': source_out['loss_anchor'] * self.args.alpha * self.args.anchor_aux_loss_weight * source_decay_factor,
-            'loss_tuplet': source_out['loss_tuplet'] * self.args.tuplet_aux_loss_weight * source_decay_factor,
+            'loss_cls': source_out['loss_cls'] * self.args.adapt_cls_loss_weight * source_decay_factor,
+            'loss_proto': source_out['loss_proto'] * self.args.prototype_loss_weight * self.args.adapt_proto_loss_weight * source_decay_factor,
+            'loss_anchor': source_out['loss_anchor'] * self.args.alpha * self.args.anchor_aux_loss_weight * self.args.adapt_anchor_loss_weight * source_decay_factor,
+            'loss_tuplet': source_out['loss_tuplet'] * self.args.tuplet_aux_loss_weight * self.args.adapt_tuplet_loss_weight * source_decay_factor,
             'loss_uot': loss_uot,
             'loss_disc': loss_disc,
+            'loss_bary': loss_bary,
+            'loss_radius': loss_radius,
             'loss_tgt_proto': loss_tgt_proto,
             'loss_tgt_margin': loss_tgt_margin,
         }
@@ -465,6 +524,19 @@ class Model(nn.Module):
             'w_margin_mean': soft_dann_state['w_margin'].mean(),
             'w_target_mean': soft_dann_state['w_target'].mean(),
             'w_target_std': soft_dann_state['w_target'].std(),
+            'barycenter_active': float(barycenter_active),
+            'loss_bary_raw': loss_bary_raw.detach(),
+            'radius_active': float(radius_active),
+            'loss_radius_raw': loss_radius_raw.detach(),
+            'learnable_radius': self.radius.radius.detach(),
+            'known_mass_mean': barycenter_state['known_mass'].mean(),
+            'known_mass_std': barycenter_state['known_mass'].std(),
+            'barycenter_raw_norm_mean': barycenter_state['barycenter_raw_norm'].mean(),
+            'barycenter_dist_mean': barycenter_state['barycenter_distance'].mean().detach(),
+            'adapt_cls_loss_weight': float(self.args.adapt_cls_loss_weight),
+            'adapt_proto_loss_weight': float(self.args.adapt_proto_loss_weight),
+            'adapt_anchor_loss_weight': float(self.args.adapt_anchor_loss_weight),
+            'adapt_tuplet_loss_weight': float(self.args.adapt_tuplet_loss_weight),
             'tgt_proto_active': float(tgt_proto_active),
             'source_decay_factor': float(source_decay_factor),
             'prototype_update_active': source_out.get('prototype_update_active', 0.0),
@@ -535,11 +607,16 @@ class Model(nn.Module):
         return dic
 
     def train_optimizer(self):
+        train_lr_encoder = self.args.train_lr_encoder if self.args.train_lr_encoder > 0 else self.args.lr_encoder
+        default_domain_lr = self.args.lr_domain if hasattr(self.args, 'lr_domain') else self.args.lr_encoder
+        train_lr_domain = self.args.train_lr_domain if self.args.train_lr_domain > 0 else default_domain_lr
+        train_lr_radius = self.args.train_lr_radius if self.args.train_lr_radius > 0 else 1e-4
         return torch.optim.SGD(
             [
-                {'params': self.feature_encoder.parameters(), 'lr': self.args.lr_encoder},
-                {'params': self.source_classifier.parameters(), 'lr': self.args.lr_encoder},
-                {'params': self.disc_encoder.parameters(), 'lr': self.args.lr_domain if hasattr(self.args, 'lr_domain') else self.args.lr_encoder},
+                {'params': self.feature_encoder.parameters(), 'lr': train_lr_encoder},
+                {'params': self.source_classifier.parameters(), 'lr': train_lr_encoder},
+                {'params': self.disc_encoder.parameters(), 'lr': train_lr_domain},
+                {'params': self.radius.parameters(), 'lr': train_lr_radius},
             ],
             momentum=0.9,
             weight_decay=5e-4,
@@ -548,7 +625,7 @@ class Model(nn.Module):
         x, y = batch
         out = self.forward_target(x)
         prediction = self.predict_target(out)
-        self.metric.update(prediction, y, out['unknown_score'])
+        self.metric.update(prediction, y, self.get_eval_unknown_score(out))
 
     def test_end(self):
         self.metric.finish()
@@ -656,6 +733,19 @@ def parse_args():
     parser.add_argument('--tgt_proto_loss_weight', type=float, default=0.02)
     parser.add_argument('--tgt_margin_loss_weight', type=float, default=0.05)
     parser.add_argument('--tgt_margin_value', type=float, default=0.1)
+    parser.add_argument('--barycenter_warmup_epochs', type=int, default=5)
+    parser.add_argument('--barycenter_loss_weight', type=float, default=0.0)
+    parser.add_argument('--radius_warmup_epochs', type=int, default=5)
+    parser.add_argument('--radius_loss_weight', type=float, default=0.0)
+    parser.add_argument('--learnable_radius_init', type=float, default=0.0)
+    parser.add_argument('--learnable_radius_margin', type=float, default=0.1)
+    parser.add_argument('--adapt_cls_loss_weight', type=float, default=1.0)
+    parser.add_argument('--adapt_proto_loss_weight', type=float, default=1.0)
+    parser.add_argument('--adapt_anchor_loss_weight', type=float, default=1.0)
+    parser.add_argument('--adapt_tuplet_loss_weight', type=float, default=1.0)
+    parser.add_argument('--train_lr_encoder', type=float, default=-1.0)
+    parser.add_argument('--train_lr_domain', type=float, default=-1.0)
+    parser.add_argument('--train_lr_radius', type=float, default=-1.0)
     parser.add_argument('--tau_close', type=float, default=0.05)
     parser.add_argument('--tau_margin', type=float, default=0.05)
     parser.add_argument('--proto_update_stop_epoch', type=int, default=10)
@@ -675,7 +765,7 @@ def parse_args():
     parser.add_argument('--save_last_checkpoint', type=str, default='True')
     parser.add_argument('--save_best_oracle_checkpoint', type=str, default='True')
     parser.add_argument('--unknown_score_alpha', type=float, default=0.5)
-    parser.add_argument('--open_set_decision', type=str, choices=['threshold', 'transport'], default='threshold')
+    parser.add_argument('--open_set_decision', type=str, choices=['threshold', 'transport', 'radius'], default='threshold')
 
     args = parser.parse_args()
     mergeArgs(args, args.target_dataset, getCliOverrideKeys())
