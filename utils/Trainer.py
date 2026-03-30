@@ -23,6 +23,7 @@ class Trainer:
             optimizer = [optimizer]
         loop_step: Callable = getattr(self.model, f'{hook}_step')
         epoch_end = getFunc(self.model, f'{hook}_epoch_end')
+        step_end = getFunc(self.model, f'{hook}_step_end')
 
         for epoch in range(epochs):
             
@@ -34,6 +35,8 @@ class Trainer:
                 with OptimizerManager(optimizer):
                     loss.backward()
 
+                if step_end is not None:
+                    step_end()
                 progress.add_information(information)
 
             epoch_out: dict = epoch_end()
@@ -45,14 +48,20 @@ class Trainer:
         self.model.eval()
 
         loop_step: Callable = getattr(self.model, f'{hook}_step')
+        test_start = getFunc(self.model, f'{hook}_start')
         test_end = getFunc(self.model, f'{hook}_end')
+        test_finish = getFunc(self.model, f'{hook}_finish')
 
         with torch.no_grad():
+            if test_start is not None:
+                test_start()
             for data in tqdm(dataloader):
                 data = dataToDevice(data, self.device)
                 loop_step(data)
 
             test_end()
+            if test_finish is not None:
+                test_finish()
 
 def parseTrainStepOut(step_out: Collecter) -> Sequence:
     out_type = type(step_out)

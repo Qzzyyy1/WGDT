@@ -1,5 +1,6 @@
 import copy
 import os
+from contextlib import contextmanager
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -98,6 +99,11 @@ class Model(nn.Module):
             self.teacher_feature_encoder = None
             self.teacher_prototype_memory = None
 
+        self.use_eval_ema = args.use_eval_ema == 'True'
+        self.eval_ema_initialized = False
+        self.eval_ema_state = {}
+        self.eval_ema_backup = None
+
     def get_unknown_threshold(self):
         return float(self.running_threshold.item())
 
@@ -123,6 +129,73 @@ class Model(nn.Module):
         for parameter in self.teacher_feature_encoder.parameters():
             parameter.requires_grad = False
         self.teacher_feature_encoder.eval()
+
+    def _iter_eval_ema_tensors(self):
+        tracked_prefixes = (
+            'feature_encoder.',
+            'source_classifier.',
+            'anchor.',
+            'radius.',
+            'prototype_memory.',
+            'uot_solver.',
+        )
+        tracked_buffers = {
+            'running_threshold',
+            'threshold_initialized',
+            'class_radius',
+            'class_radius_initialized',
+        }
+        for name, parameter in self.named_parameters():
+            if name.startswith('teacher_'):
+                continue
+            if name.startswith(tracked_prefixes):
+                yield name, parameter
+        for name, buffer in self.named_buffers():
+            if name.startswith('teacher_') or name.startswith('source_oa.') or name.startswith('metric.'):
+                continue
+            if name in tracked_buffers or name.startswith(tracked_prefixes):
+                yield name, buffer
+
+    @torch.no_grad()
+    def init_eval_ema_state(self):
+        self.eval_ema_state = {}
+        for name, tensor in self._iter_eval_ema_tensors():
+            self.eval_ema_state[name] = tensor.detach().clone()
+        self.eval_ema_initialized = True
+
+    @torch.no_grad()
+    def update_eval_ema_state(self):
+        if not self.use_eval_ema:
+            return
+        if not self.eval_ema_initialized:
+            self.init_eval_ema_state()
+            return
+        decay = float(self.args.eval_ema_decay)
+        for name, tensor in self._iter_eval_ema_tensors():
+            if name not in self.eval_ema_state:
+                self.eval_ema_state[name] = tensor.detach().clone()
+                continue
+            if torch.is_floating_point(tensor):
+                self.eval_ema_state[name].mul_(decay).add_(tensor.detach(), alpha=1.0 - decay)
+            else:
+                self.eval_ema_state[name].copy_(tensor.detach())
+
+    @torch.no_grad()
+    def apply_eval_ema_state(self):
+        if not self.use_eval_ema or not self.eval_ema_initialized or self.eval_ema_backup is not None:
+            return
+        self.eval_ema_backup = {}
+        for name, tensor in self._iter_eval_ema_tensors():
+            self.eval_ema_backup[name] = tensor.detach().clone()
+            tensor.copy_(self.eval_ema_state[name])
+
+    @torch.no_grad()
+    def restore_eval_ema_state(self):
+        if self.eval_ema_backup is None:
+            return
+        for name, tensor in self._iter_eval_ema_tensors():
+            tensor.copy_(self.eval_ema_backup[name])
+        self.eval_ema_backup = None
 
     @torch.no_grad()
     def sync_teacher_from_student(self):
@@ -196,6 +269,149 @@ class Model(nn.Module):
             'w_target': w_target,
         }
 
+    def compute_wgdt_style_target_state(self, out):
+        eps = 1e-8
+        mode = getattr(self.args, 'radius_score_mode', 'prototype_distance')
+        if mode == 'anchor_gamma':
+            distance = out['distance']
+            gamma = out['gamma']
+            min_distance, distance_prediction = distance.min(dim=1)
+            min_gamma, gamma_prediction = gamma.min(dim=1)
+            score = min_gamma
+            prediction = gamma_prediction
+            distance_matrix = distance
+            gamma_matrix = gamma
+            score_mean = min_gamma.detach().mean()
+            score_std = min_gamma.detach().std()
+            class_scale = torch.ones_like(min_distance)
+            class_scale_initialized = torch.ones_like(distance_prediction, dtype=torch.bool)
+        elif mode == 'prototype_distance_classwise':
+            distance_matrix = self.compute_feature_prototype_distance(out['features'])
+            class_prediction = out['prediction'].detach().long()
+            class_prediction = class_prediction.clamp(min=0, max=self.known_num_classes - 1)
+            class_distance = distance_matrix.gather(1, class_prediction.unsqueeze(1)).squeeze(1)
+            gamma_matrix = None
+            raw_class_scale = self.class_radius[class_prediction].detach()
+            class_scale_initialized = self.class_radius_initialized[class_prediction]
+            if self.class_radius_initialized.any():
+                fallback_scale = self.class_radius[self.class_radius_initialized].mean().detach()
+            else:
+                fallback_scale = class_distance.detach().mean()
+            class_scale = torch.where(
+                class_scale_initialized,
+                raw_class_scale,
+                torch.full_like(raw_class_scale, fallback_scale),
+            ).clamp_min(eps)
+            score = class_distance / class_scale
+            prediction = class_prediction
+            score_mean = score.detach().mean()
+            score_std = score.detach().std()
+            min_distance = class_distance
+            distance_prediction = class_prediction
+        else:
+            distance_matrix = self.compute_feature_prototype_distance(out['features'])
+            min_distance, distance_prediction = distance_matrix.min(dim=1)
+            gamma_matrix = None
+            score = min_distance
+            prediction = distance_prediction
+            score_mean = min_distance.detach().mean()
+            score_std = min_distance.detach().std()
+            class_scale = torch.ones_like(min_distance)
+            class_scale_initialized = torch.ones_like(distance_prediction, dtype=torch.bool)
+
+        score_detached = score.detach()
+        score_max = score_detached.max()
+        score_min = score_detached.min()
+        score_range = (score_max - score_min).clamp_min(eps)
+        weight = (score_max - score_detached) / score_range
+        if torch.allclose(score_max, score_min):
+            weight = torch.ones_like(score_detached)
+
+        distance_detached = min_distance.detach()
+
+        return {
+            'mode': mode,
+            'distance_matrix': distance_matrix,
+            'gamma_matrix': gamma_matrix,
+            'min_distance': min_distance,
+            'score': score,
+            'distance_prediction': distance_prediction,
+            'prediction': prediction,
+            'weight': weight,
+            'score_mean': score_mean,
+            'score_std': score_std,
+            'distance_mean': distance_detached.mean(),
+            'distance_std': distance_detached.std(),
+            'class_scale_mean': class_scale.mean().detach(),
+            'class_scale_std': class_scale.std().detach(),
+            'class_scale_initialized_ratio': class_scale_initialized.float().mean(),
+            'weight_mean': weight.mean(),
+            'weight_std': weight.std(),
+        }
+
+    def weighted_mean(self, value, weight=None):
+        if value.numel() == 0:
+            return self.radius.radius.new_zeros(())
+        if weight is None:
+            return value.mean()
+        weight = weight.to(value.dtype)
+        return (value * weight).sum() / weight.sum().clamp_min(1e-8)
+
+    def compute_dual_boundary_radius_state(self, wgdt_target_state):
+        score = wgdt_target_state['score'].detach()
+        weight = wgdt_target_state['weight'].detach().clamp(0.0, 1.0)
+
+        positive_quantile = max(float(self.args.radius_positive_quantile), float(self.args.radius_negative_quantile))
+        negative_quantile = min(float(self.args.radius_positive_quantile), float(self.args.radius_negative_quantile))
+        positive_cutoff = torch.quantile(weight.float(), positive_quantile)
+        negative_cutoff = torch.quantile(weight.float(), negative_quantile)
+
+        positive_mask = weight >= positive_cutoff
+        negative_mask = weight <= negative_cutoff
+        if positive_mask.sum() == 0:
+            positive_mask[torch.argmax(weight)] = True
+        if negative_mask.sum() == 0:
+            negative_mask[torch.argmin(weight)] = True
+
+        radius_value = self.radius.radius.squeeze(0)
+        positive_scores = score[positive_mask]
+        negative_scores = score[negative_mask]
+        positive_weight = weight[positive_mask].clamp_min(1e-8)
+        negative_weight = (1.0 - weight[negative_mask]).clamp_min(1e-8)
+
+        positive_margin = float(self.args.radius_positive_margin)
+        negative_margin = float(self.args.radius_negative_margin)
+        positive_violation = F.relu(positive_scores - (radius_value - positive_margin))
+        negative_violation = F.relu((radius_value + negative_margin) - negative_scores)
+
+        if int(self.args.radius_boundary_power) == 2:
+            positive_term = positive_violation.square()
+            negative_term = negative_violation.square()
+        else:
+            positive_term = positive_violation
+            negative_term = negative_violation
+
+        positive_loss = self.weighted_mean(positive_term, positive_weight)
+        negative_loss = self.weighted_mean(negative_term, negative_weight)
+        loss_raw = (
+            positive_loss * float(self.args.radius_positive_loss_weight)
+            + negative_loss * float(self.args.radius_negative_loss_weight)
+        )
+
+        return {
+            'loss_raw': loss_raw,
+            'positive_loss': positive_loss.detach(),
+            'negative_loss': negative_loss.detach(),
+            'positive_ratio': positive_mask.float().mean(),
+            'negative_ratio': negative_mask.float().mean(),
+            'positive_score_mean': positive_scores.mean().detach(),
+            'negative_score_mean': negative_scores.mean().detach(),
+            'positive_cutoff': positive_cutoff.detach(),
+            'negative_cutoff': negative_cutoff.detach(),
+            'positive_weight_mean': positive_weight.mean().detach(),
+            'negative_weight_mean': negative_weight.mean().detach(),
+        }
+
     def compute_transport_barycenter_state(self, out, teacher_out=None):
         eps = 1e-8
         feature_norm = F.normalize(out['features'], p=2, dim=1)
@@ -218,7 +434,15 @@ class Model(nn.Module):
             posterior_confidence = class_posterior.max(dim=1)[0]
             clean_weight = known_mass.detach() * posterior_confidence.detach()
             open_set_confidence = 1.0 - reference_out['unknown_score'].detach()
-            ultimate_weight = clean_weight * open_set_confidence
+            soft_weight = clean_weight * open_set_confidence
+
+            teacher_hard_mask = (
+                (posterior_confidence >= float(self.args.teacher_conf_threshold))
+                & (open_set_confidence >= float(self.args.teacher_open_threshold))
+            )
+            residual_weight = soft_weight * (~teacher_hard_mask).float() * float(self.args.barycenter_residual_weight)
+            selected_weight = soft_weight * teacher_hard_mask.float()
+            ultimate_weight = selected_weight + residual_weight
 
         barycenter_distance = 0.5 * (feature_norm - barycenter.detach()).pow(2).sum(dim=1)
         loss_raw = (
@@ -229,7 +453,11 @@ class Model(nn.Module):
             'known_transport': known_transport,
             'known_mass': known_mass,
             'clean_weight': clean_weight,
+            'soft_weight': soft_weight,
+            'selected_weight': selected_weight,
+            'residual_weight': residual_weight,
             'ultimate_weight': ultimate_weight,
+            'teacher_hard_mask': teacher_hard_mask,
             'open_set_confidence': open_set_confidence,
             'posterior_confidence': posterior_confidence,
             'class_posterior': class_posterior,
@@ -286,9 +514,9 @@ class Model(nn.Module):
                 self.known_num_classes,
             )
         if self.args.open_set_decision == 'radius':
-            prediction = out['class_scores'].argmax(dim=1)
-            prediction = prediction.clone()
-            prediction[out['unknown_score'] > self.radius.radius.detach()] = self.known_num_classes
+            wgdt_state = self.compute_wgdt_style_target_state(out)
+            prediction = wgdt_state['prediction'].clone()
+            prediction[wgdt_state['score'] > self.radius.radius.detach()] = self.known_num_classes
             return prediction
         gate_state = self.get_target_gate_state(out)
         prediction = gate_state['candidate_preds'].clone()
@@ -296,6 +524,8 @@ class Model(nn.Module):
         return prediction
 
     def get_eval_unknown_score(self, out):
+        if self.args.open_set_decision == 'radius':
+            return self.compute_wgdt_style_target_state(out)['score'].detach()
         return out['unknown_score']
 
     def build_unknown_score(self, out):
@@ -378,6 +608,7 @@ class Model(nn.Module):
         unknown_score_list = []
 
         self.eval()
+        self.apply_eval_ema_state()
         with torch.no_grad():
             for data in self.oracle_loader:
                 x, y = dataToDevice(data, self.device)
@@ -385,7 +616,8 @@ class Model(nn.Module):
                 prediction = self.predict_target(out)
                 prediction_list.append(prediction.detach().cpu())
                 target_list.append(y.detach().cpu())
-                unknown_score_list.append(out['unknown_score'].detach().cpu())
+                unknown_score_list.append(self.get_eval_unknown_score(out).detach().cpu())
+        self.restore_eval_ema_state()
 
         if was_training:
             self.train()
@@ -401,9 +633,9 @@ class Model(nn.Module):
     def encode(self, x):
         return self.feature_encoder(x)['features']
 
-    def forward_source(self, x, y=None, epoch=None, update_prototypes=False):
+    def forward_source(self, x, y=None, epoch=None, update_prototypes=False, respect_proto_stop=True):
         features = self.encode(x)
-        prototype_update_active = update_prototypes and self.is_prototype_update_active(epoch)
+        prototype_update_active = update_prototypes and (self.is_prototype_update_active(epoch) if respect_proto_stop else True)
         if y is not None and prototype_update_active:
             self.prototype_memory.update(features, y, epoch=epoch)
 
@@ -445,12 +677,14 @@ class Model(nn.Module):
         features = self.encode(x)
         classifier_logits = self.source_classifier(features)
         classifier_scores = torch.softmax(classifier_logits, dim=1)
+        anchor_out = self.anchor(classifier_logits)
         prototypes = self.prototype_memory.get_prototypes().detach()
         uot_out = self.uot_solver(prototypes, features)
         out = {
             'features': features,
             'classifier_logits': classifier_logits,
             'classifier_scores': classifier_scores,
+            **anchor_out,
             **uot_out,
         }
         return self.build_unknown_score(out)
@@ -463,10 +697,16 @@ class Model(nn.Module):
             self.sync_teacher_from_student()
         self.teacher_feature_encoder.eval()
         features = self.teacher_feature_encoder(x)['features']
+        classifier_logits = self.source_classifier(features)
+        classifier_scores = torch.softmax(classifier_logits, dim=1)
+        anchor_out = self.anchor(classifier_logits)
         prototypes = self.teacher_prototype_memory.get_prototypes().detach()
         uot_out = self.uot_solver(prototypes, features)
         out = {
             'features': features,
+            'classifier_logits': classifier_logits,
+            'classifier_scores': classifier_scores,
+            **anchor_out,
             **uot_out,
         }
         return self.build_unknown_score(out)
@@ -479,7 +719,7 @@ class Model(nn.Module):
     def pre_train_step(self, batch):
         x, y = batch
         epoch = self.progress.epoch if hasattr(self, 'progress') else 0
-        out = self.forward_source(x, y, epoch=epoch, update_prototypes=True)
+        out = self.forward_source(x, y, epoch=epoch, update_prototypes=True, respect_proto_stop=False)
         loss = (
             out['loss_cls']
             + self.args.prototype_loss_weight * out['loss_proto']
@@ -539,7 +779,8 @@ class Model(nn.Module):
         dann_stop_reached = self.args.dann_stop_epochs > 0 and epoch >= self.args.dann_stop_epochs
         dann_active = epoch >= self.args.dann_warmup_epochs and not dann_stop_reached
         soft_dann_state = self.compute_soft_dann_target_weights(target_out)
-        target_weight = soft_dann_state['w_target']
+        wgdt_target_state = self.compute_wgdt_style_target_state(target_out)
+        target_weight = wgdt_target_state['weight'] if self.args.open_set_decision == 'radius' else soft_dann_state['w_target']
         loss_disc = self.domain_adv(
             source_out['features'],
             target_out['features'],
@@ -551,10 +792,17 @@ class Model(nn.Module):
         loss_bary_raw = barycenter_state['loss_raw']
         loss_bary = loss_bary_raw * self.args.barycenter_loss_weight if barycenter_active else target_out['loss'] * 0.0
         radius_active = epoch >= self.args.radius_warmup_epochs
-        loss_radius_raw = self.radius(
-            target_out['unknown_score'].detach(),
-            weight=barycenter_state['ultimate_weight'].detach(),
-        )
+        radius_score = wgdt_target_state['score'] if self.args.open_set_decision == 'radius' else target_out['unknown_score']
+        radius_weight = wgdt_target_state['weight'] if self.args.open_set_decision == 'radius' else barycenter_state['ultimate_weight']
+        radius_boundary_state = None
+        if self.args.open_set_decision == 'radius' and self.args.radius_loss_form == 'dual_boundary':
+            radius_boundary_state = self.compute_dual_boundary_radius_state(wgdt_target_state)
+            loss_radius_raw = radius_boundary_state['loss_raw']
+        else:
+            loss_radius_raw = self.radius(
+                radius_score.detach(),
+                weight=radius_weight.detach(),
+            )
         loss_radius = loss_radius_raw * self.args.radius_loss_weight if radius_active else target_out['loss'] * 0.0
 
         source_decay_factor = self.get_source_decay_factor(epoch)
@@ -594,6 +842,7 @@ class Model(nn.Module):
 
         information = {
             **loss_dic,
+            'source_oa_running': self.source_oa.compute(),
             'dustbin_mean': target_out['dustbin_scores'].mean(),
             'unknown_score_mean': target_out['unknown_score'].mean(),
             'dustbin_cost': target_out['dustbin_cost'],
@@ -604,6 +853,20 @@ class Model(nn.Module):
             'loss_disc_raw': self.domain_adv.domain_discriminator_accuracy if dann_active else 0.0,
             'dann_active': float(dann_active),
             'target_known_weight_mean': target_weight.mean(),
+            'radius_score_mode': {
+                'prototype_distance': 0.0,
+                'anchor_gamma': 1.0,
+                'prototype_distance_classwise': 2.0,
+            }.get(wgdt_target_state['mode'], -1.0),
+            'wgdt_score_mean': wgdt_target_state['score_mean'],
+            'wgdt_score_std': wgdt_target_state['score_std'],
+            'wgdt_distance_mean': wgdt_target_state['distance_mean'],
+            'wgdt_distance_std': wgdt_target_state['distance_std'],
+            'wgdt_class_scale_mean': wgdt_target_state['class_scale_mean'],
+            'wgdt_class_scale_std': wgdt_target_state['class_scale_std'],
+            'wgdt_class_scale_initialized_ratio': wgdt_target_state['class_scale_initialized_ratio'],
+            'wgdt_weight_mean': wgdt_target_state['weight_mean'],
+            'wgdt_weight_std': wgdt_target_state['weight_std'],
             'w_open_mean': soft_dann_state['w_open'].mean(),
             'w_close_mean': soft_dann_state['w_close'].mean(),
             'w_margin_mean': soft_dann_state['w_margin'].mean(),
@@ -617,9 +880,24 @@ class Model(nn.Module):
             'radius_active': float(radius_active),
             'loss_radius_raw': loss_radius_raw.detach(),
             'learnable_radius': self.radius.radius.detach(),
+            'radius_loss_form': 1.0 if self.args.radius_loss_form == 'dual_boundary' else 0.0,
+            'radius_positive_ratio': radius_boundary_state['positive_ratio'] if radius_boundary_state is not None else target_out['loss'].new_zeros(()),
+            'radius_negative_ratio': radius_boundary_state['negative_ratio'] if radius_boundary_state is not None else target_out['loss'].new_zeros(()),
+            'radius_positive_loss_raw': radius_boundary_state['positive_loss'] if radius_boundary_state is not None else target_out['loss'].new_zeros(()),
+            'radius_negative_loss_raw': radius_boundary_state['negative_loss'] if radius_boundary_state is not None else target_out['loss'].new_zeros(()),
+            'radius_positive_score_mean': radius_boundary_state['positive_score_mean'] if radius_boundary_state is not None else target_out['loss'].new_zeros(()),
+            'radius_negative_score_mean': radius_boundary_state['negative_score_mean'] if radius_boundary_state is not None else target_out['loss'].new_zeros(()),
+            'radius_positive_weight_mean': radius_boundary_state['positive_weight_mean'] if radius_boundary_state is not None else target_out['loss'].new_zeros(()),
+            'radius_negative_weight_mean': radius_boundary_state['negative_weight_mean'] if radius_boundary_state is not None else target_out['loss'].new_zeros(()),
+            'radius_positive_cutoff': radius_boundary_state['positive_cutoff'] if radius_boundary_state is not None else target_out['loss'].new_zeros(()),
+            'radius_negative_cutoff': radius_boundary_state['negative_cutoff'] if radius_boundary_state is not None else target_out['loss'].new_zeros(()),
             'known_mass_mean': barycenter_state['known_mass'].mean(),
             'known_mass_std': barycenter_state['known_mass'].std(),
             'clean_weight_mean': barycenter_state['clean_weight'].mean(),
+            'soft_weight_mean': barycenter_state['soft_weight'].mean(),
+            'selected_weight_mean': barycenter_state['selected_weight'].mean(),
+            'residual_weight_mean': barycenter_state['residual_weight'].mean(),
+            'teacher_hard_mask_ratio': barycenter_state['teacher_hard_mask'].float().mean(),
             'open_set_conf_mean': barycenter_state['open_set_confidence'].mean(),
             'ultimate_weight_mean': barycenter_state['ultimate_weight'].mean(),
             'posterior_confidence_mean': barycenter_state['posterior_confidence'].mean(),
@@ -676,8 +954,16 @@ class Model(nn.Module):
             'source_oa': self.source_oa.compute(),
             'running_threshold': threshold,
         }
+        if self.use_eval_ema and self.eval_ema_initialized and 'radius.radius' in self.eval_ema_state:
+            dic['eval_ema_radius'] = float(self.eval_ema_state['radius.radius'].item())
         if target_dustbin_ratio is not None:
             dic['target_dustbin_ratio'] = target_dustbin_ratio
+
+        summary_parts = [f"source_oa={float(dic['source_oa']):.4f}"]
+        if 'eval_ema_radius' in dic:
+            summary_parts.append(f"eval_ema_radius={float(dic['eval_ema_radius']):.4f}")
+        summary_parts.append(f"running_threshold={float(dic['running_threshold']):.4f}")
+        print('[Train Summary] ' + ', '.join(summary_parts))
 
         oracle_result = self.evaluate_oracle()
         if oracle_result is not None:
@@ -701,6 +987,22 @@ class Model(nn.Module):
         if self.args.save_last_checkpoint == 'True':
             self.save_checkpoint('last_checkpoint.pth', {'target_dustbin_ratio': float(target_dustbin_ratio) if target_dustbin_ratio is not None else None})
         return dic
+
+    def train_step_end(self):
+        if self.use_eval_ema and (self.progress.epoch if hasattr(self, 'progress') else 0) >= self.args.eval_ema_start_epoch:
+            self.update_eval_ema_state()
+
+    def test_start(self):
+        self.apply_eval_ema_state()
+
+    def test_finish(self):
+        self.restore_eval_ema_state()
+
+    def prediction_start(self):
+        self.apply_eval_ema_state()
+
+    def prediction_finish(self):
+        self.restore_eval_ema_state()
 
     def train_optimizer(self):
         train_lr_encoder = self.args.train_lr_encoder if self.args.train_lr_encoder > 0 else self.args.lr_encoder
@@ -835,6 +1137,15 @@ def parse_args():
     parser.add_argument('--radius_loss_weight', type=float, default=0.0)
     parser.add_argument('--learnable_radius_init', type=float, default=0.0)
     parser.add_argument('--learnable_radius_margin', type=float, default=0.1)
+    parser.add_argument('--radius_score_mode', type=str, choices=['prototype_distance', 'prototype_distance_classwise', 'anchor_gamma'], default='prototype_distance')
+    parser.add_argument('--radius_loss_form', type=str, choices=['margin_mse', 'dual_boundary'], default='dual_boundary')
+    parser.add_argument('--radius_positive_quantile', type=float, default=0.7)
+    parser.add_argument('--radius_negative_quantile', type=float, default=0.3)
+    parser.add_argument('--radius_positive_margin', type=float, default=0.0)
+    parser.add_argument('--radius_negative_margin', type=float, default=0.0)
+    parser.add_argument('--radius_positive_loss_weight', type=float, default=1.0)
+    parser.add_argument('--radius_negative_loss_weight', type=float, default=1.0)
+    parser.add_argument('--radius_boundary_power', type=int, choices=[1, 2], default=2)
     parser.add_argument('--barycenter_sharpen_t', type=float, default=0.5)
     parser.add_argument('--adapt_cls_loss_weight', type=float, default=1.0)
     parser.add_argument('--adapt_proto_loss_weight', type=float, default=1.0)
@@ -845,6 +1156,12 @@ def parse_args():
     parser.add_argument('--train_lr_radius', type=float, default=-1.0)
     parser.add_argument('--use_ema_teacher', type=str, default='False')
     parser.add_argument('--teacher_momentum', type=float, default=0.999)
+    parser.add_argument('--use_eval_ema', type=str, default='False')
+    parser.add_argument('--eval_ema_decay', type=float, default=0.999)
+    parser.add_argument('--eval_ema_start_epoch', type=int, default=0)
+    parser.add_argument('--teacher_conf_threshold', type=float, default=0.7)
+    parser.add_argument('--teacher_open_threshold', type=float, default=0.6)
+    parser.add_argument('--barycenter_residual_weight', type=float, default=0.0)
     parser.add_argument('--tau_close', type=float, default=0.05)
     parser.add_argument('--tau_margin', type=float, default=0.05)
     parser.add_argument('--proto_update_stop_epoch', type=int, default=10)

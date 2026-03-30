@@ -11,9 +11,10 @@ class MarginMSELoss(nn.Module):
         self.loss = nn.MSELoss(reduction='none')
 
     def forward(self, input: torch.Tensor, target: torch.Tensor, weight: Optional[torch.Tensor] = None) -> torch.Tensor:
-        loss =  self.loss(input, target + self.margin)
+        loss = self.loss(input, target + self.margin)
         if weight is not None:
-            loss = weight * loss
+            weight = weight.to(loss.dtype)
+            return (weight * loss).sum() / weight.sum().clamp_min(1e-8)
 
         return loss.mean()
         
